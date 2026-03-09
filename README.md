@@ -10,9 +10,11 @@ Mnemo is a local-first conversational assistant stack with:
 
 It supports:
 
-- text chat (`/chat`)
-- voice chat (`/voice/chat`) with simultaneous streamed text tokens and streamed audio chunks
-- customizable system prompts from `app/prompts/*.txt`
+- **Text Chat** (`/chat`): Text input → LLM → Text response
+- **Voice Chat** (`/voice/chat`): Voice/text input → (STT if needed) → LLM → TTS → Streamed audio + text output with low-latency playback
+- Customizable system prompts from `app/prompts/*.txt`
+
+The voice chat endpoint streams audio chunks and text clauses as they're generated, enabling the client to start playback before the full response completes.
 
 ## Project Structure
 
@@ -41,13 +43,15 @@ From `mnemo-backend`:
 docker compose up -d --build
 ```
 
-Services:
+Services exposed:
 
-- App API: `http://localhost:8000`
-- Whisper API: `http://localhost:8001`
-- Ollama: `http://localhost:11434`
-- Kokoro: `http://localhost:8880`
-- Postgres: `localhost:5432`
+- App API: `http://localhost:8000` (FastAPI with `/chat` and `/voice/chat` endpoints)
+- Ollama: `http://localhost:11434` (internal LLM service)
+- Kokoro: `http://localhost:8880` (internal TTS service)
+- Whisper: `http://localhost:8001` (internal STT service)
+- Postgres: `localhost:5432` (internal database)
+
+All services except the App API are internal and accessed by the backend only. Client requests go to the App API.
 
 ### 2. First run model pull behavior
 
@@ -130,7 +134,7 @@ Response:
 - `POST /voice/chat`
 - Response `Content-Type`: `text/event-stream`
 
-Request body:
+**Request body** (either `text` or `audio_b64`, not both):
 
 ```json
 {
@@ -138,43 +142,94 @@ Request body:
 	"voice": "af_heart",
 	"lang_code": "a",
 	"speed": 1.0,
+	"audio_language": "en",
 	"system_prompt": "optional inline prompt",
 	"system_prompt_file": "optional-file.txt"
 }
 ```
 
-SSE events emitted by backend:
+Or with audio input:
 
-- `token`: incremental text token(s) from Ollama
-- `clause`: clause boundary chosen for TTS
-- `audio`: base64 WAV audio chunk for current clause
-- `audio_clause_done`: no more audio chunks for that clause
-- `text_done`: text generation finished
-- `audio_done`: audio generation finished
-- `done`: stream complete
-- `error`: recoverable/final stream error information
+```json
+{
+	"audio_b64": "base64-encoded-audio-data",
+	"voice": "af_heart",
+	"lang_code": "a",
+	"speed": 1.0,
+	"audio_language": "en",
+	"system_prompt": "optional inline prompt",
+	"system_prompt_file": "optional-file.txt"
+}
+```
 
-### Realtime Speech-To-Text (Bidirectional Streaming)
+**Complete SSE event flow**:
 
-- `WS /ws/transcribe` on `whisper` service (`ws://localhost:8001/ws/transcribe`)
-- Binary frames: audio blobs (16-bit PCM chunks or WAV blobs)
-- Text frames: JSON control events
+1. **stt_started** (if audio input provided)
+   ```json
+   {"status": "transcribing"}
+   ```
 
-Control events sent by client:
+2. **stt_done** (if audio input provided)
+   ```json
+   {"text": "transcribed user speech"}
+   ```
 
-- `{"event":"start","sample_rate":48000,"language":"en"}`
-- `{"event":"flush"}`
-- `{"event":"end"}`
+3. **llm_started**
+   ```json
+   {"status": "generating"}
+   ```
 
-Events sent by server:
+4. **tts_started**
+   ```json
+   {"status": "synthesizing"}
+   ```
 
-- `ready`: socket accepted and format metadata
-- `started`: stream metadata acknowledged
-- `token`: one finalized word token with timestamps (`start`, `end` seconds)
-- `done`: final stitched transcript text
-- `error`: protocol or decoding/transcription issues
+5. **audio** (multiple events as clauses are synthesized)
+   ```json
+   {
+     "index": 1,
+     "chunk_b64": "base64-encoded-audio-chunk"
+   }
+   ```
 
-The client renders `token` events to the chat bubble as they arrive and buffers `audio` chunks per clause. It queues playback only after `audio_clause_done`, so chunks play sequentially and smoothly.
+6. **audio_clause_done** (after each clause is fully synthesized)
+   ```json
+   {
+     "index": 1,
+     "text": "First clause of response."
+   }
+   ```
+
+7. **text_done** (after LLM finishes generating)
+   ```json
+   {"done": true}
+   ```
+
+8. **audio_done** (after all audio synthesis completes)
+   ```json
+   {"done": true}
+   ```
+
+9. **done** (final completion marker)
+   ```json
+   {"done": true}
+   ```
+
+10. **error** (if any error occurs)
+    ```json
+    {"message": "Error description"}
+    ```
+
+**Event Processing**:
+- The client accumulates audio chunks (`audio` events) per clause index
+- When `audio_clause_done` arrives, the client queues the complete audio for playback
+- Audio chunks play sequentially after each clause completes (not waiting for full response)
+- Text is buffered and displayed as each clause is synthesized
+- This enables near-real-time playback while maintaining coherent speech
+
+### Realtime Speech-To-Text
+
+To use only STT without LLM/TTS processing, send `audio_b64` without expecting a full voice chat response. The backend handles this via the Voice Chat endpoint with automatic transcription.
 
 ## Useful Commands
 

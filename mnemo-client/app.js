@@ -1,9 +1,6 @@
-const chatForm = document.getElementById("chatForm");
-const messageInput = document.getElementById("messageInput");
 const chatWindow = document.getElementById("chatWindow");
-const sendButton = document.getElementById("sendButton");
+const recordButton = document.getElementById("recordButton");
 const apiBaseInput = document.getElementById("apiBase");
-const voiceModeInput = document.getElementById("voiceMode");
 const voiceNameInput = document.getElementById("voiceName");
 const langCodeInput = document.getElementById("langCode");
 const speedInput = document.getElementById("speed");
@@ -12,6 +9,11 @@ let audioQueue = [];
 let isAudioPlaying = false;
 let playbackWaiters = [];
 let lastPlaybackError = null;
+
+// Voice recording state
+let mediaRecorder = null;
+let audioChunks = [];
+let isRecording = false;
 
 function addMessage(role, text) {
   const el = document.createElement("article");
@@ -23,9 +25,7 @@ function addMessage(role, text) {
 }
 
 function setBusy(isBusy) {
-  sendButton.disabled = isBusy;
-  messageInput.disabled = isBusy;
-  voiceModeInput.disabled = isBusy;
+  recordButton.disabled = isBusy;
   voiceNameInput.disabled = isBusy;
   langCodeInput.disabled = isBusy;
   speedInput.disabled = isBusy;
@@ -139,91 +139,7 @@ function parseSseBlock(block) {
   }
 }
 
-function parseStreamChunk(chunk) {
-  // Supports plain text, NDJSON lines, and SSE-style `data:` lines.
-  const lines = chunk.split(/\r?\n/).filter(Boolean);
-  if (lines.length === 0) {
-    return chunk;
-  }
-
-  let output = "";
-  for (const line of lines) {
-    const cleaned = line.startsWith("data:") ? line.slice(5).trim() : line;
-    try {
-      const obj = JSON.parse(cleaned);
-      if (typeof obj.response === "string") {
-        output += obj.response;
-      } else if (typeof obj.text === "string") {
-        output += obj.text;
-      } else {
-        output += cleaned;
-      }
-    } catch {
-      output += cleaned;
-    }
-  }
-  return output;
-}
-
-async function streamChatResponse(baseUrl, userText, assistantEl) {
-  const response = await fetch(`${baseUrl}/chat`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ text: userText }),
-  });
-
-  if (!response.ok) {
-    let detail = `HTTP ${response.status}`;
-    try {
-      const err = await response.json();
-      if (err?.detail) {
-        detail = `${detail}: ${err.detail}`;
-      }
-    } catch {
-      // Keep default detail when error body is not JSON.
-    }
-    throw new Error(detail);
-  }
-
-  if (!response.body) {
-    const data = await response.json();
-    assistantEl.textContent = data?.response || "";
-    return;
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) {
-      break;
-    }
-    buffer += decoder.decode(value, { stream: true });
-
-    const splitLines = buffer.split(/\r?\n/);
-    buffer = splitLines.pop() || "";
-    const complete = splitLines.join("\n");
-    if (complete) {
-      assistantEl.textContent += parseStreamChunk(complete);
-    }
-
-    chatWindow.scrollTop = chatWindow.scrollHeight;
-  }
-
-  if (buffer) {
-    assistantEl.textContent += parseStreamChunk(buffer);
-  }
-
-  if (!assistantEl.textContent.trim()) {
-    assistantEl.textContent = "";
-  }
-}
-
-async function streamVoiceResponse(baseUrl, payload, assistantEl) {
+async function streamVoiceResponse(baseUrl, payload, assistantEl, sttMessageEl = null) {
   const response = await fetch(`${baseUrl}/voice/chat`, {
     method: "POST",
     headers: {
@@ -238,7 +154,12 @@ async function streamVoiceResponse(baseUrl, payload, assistantEl) {
     try {
       const err = JSON.parse(errorText);
       if (err?.detail) {
-        detail = `${detail}: ${err.detail}`;
+        // Handle validation errors (422)
+        if (Array.isArray(err.detail)) {
+          detail = `${detail}: ${err.detail.map(e => `${e.loc.join('.')} - ${e.msg}`).join(', ')}`;
+        } else {
+          detail = `${detail}: ${err.detail}`;
+        }
       }
     } catch {
       if (errorText) {
@@ -278,7 +199,13 @@ async function streamVoiceResponse(baseUrl, payload, assistantEl) {
         continue;
       }
 
-      if (parsed.event === "audio") {
+      if (parsed.event === "stt_done") {
+        // Display the transcribed text from STT
+        if (typeof parsed.data.text === "string" && sttMessageEl) {
+          sttMessageEl.textContent = parsed.data.text;
+          chatWindow.scrollTop = chatWindow.scrollHeight;
+        }
+      } else if (parsed.event === "audio") {
         if (typeof parsed.data.chunk_b64 === "string" && Number.isInteger(parsed.data.index)) {
           const clauseIndex = parsed.data.index;
           const audioBytes = decodeBase64ToBytes(parsed.data.chunk_b64);
@@ -379,48 +306,122 @@ async function streamVoiceResponse(baseUrl, payload, assistantEl) {
   }
 }
 
-chatForm.addEventListener("submit", async (event) => {
-  event.preventDefault();
 
-  const userText = messageInput.value.trim();
+
+// Voice recording functionality
+recordButton.addEventListener("click", async () => {
+  if (isRecording) {
+    // Stop recording
+    stopRecording();
+  } else {
+    // Start recording
+    await startRecording();
+  }
+});
+
+async function startRecording() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    
+    // Use webm format which is widely supported
+    const options = { mimeType: 'audio/webm' };
+    if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+      options.mimeType = 'audio/ogg';
+    }
+    if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+      options.mimeType = 'audio/wav';
+    }
+    
+    mediaRecorder = new MediaRecorder(stream, options);
+    audioChunks = [];
+    
+    mediaRecorder.ondataavailable = (event) => {
+      if (event.data.size > 0) {
+        audioChunks.push(event.data);
+      }
+    };
+    
+    mediaRecorder.onstop = async () => {
+      const audioBlob = new Blob(audioChunks, { type: mediaRecorder.mimeType });
+      await sendVoiceMessage(audioBlob);
+      
+      // Stop all tracks
+      stream.getTracks().forEach(track => track.stop());
+    };
+    
+    mediaRecorder.start();
+    isRecording = true;
+    recordButton.textContent = "⏹️ Stop Recording";
+    recordButton.classList.add("recording");
+  } catch (error) {
+    alert(`Microphone access denied or unavailable: ${error.message}`);
+    console.error("Recording error:", error);
+  }
+}
+
+function stopRecording() {
+  if (mediaRecorder && mediaRecorder.state !== "inactive") {
+    mediaRecorder.stop();
+    isRecording = false;
+    recordButton.textContent = "🎤 Hold to Talk";
+    recordButton.classList.remove("recording");
+  }
+}
+
+async function sendVoiceMessage(audioBlob) {
   const baseUrl = apiBaseInput.value.trim().replace(/\/$/, "");
-  const useVoiceMode = voiceModeInput.checked;
   const voice = voiceNameInput.value.trim() || "af_heart";
   const langCode = (langCodeInput.value.trim() || "a").slice(0, 1);
   const speed = Number(speedInput.value);
-
-  if (!userText || !baseUrl) {
+  
+  if (!baseUrl) {
+    alert("Please set the API Base URL");
     return;
   }
-
-  addMessage("user", userText);
-  const assistantEl = addMessage("assistant", "");
-  messageInput.value = "";
+  
   setBusy(true);
-
+  
+  // Show user message as "🎤 Voice Message"
+  const userEl = addMessage("user", "🎤 Voice Message (transcribing...)");
+  const assistantEl = addMessage("assistant", "");
+  
   try {
-    if (useVoiceMode) {
-      await streamVoiceResponse(
-        baseUrl,
-        {
-          text: userText,
-          voice,
-          lang_code: langCode,
-          speed: Number.isFinite(speed) ? speed : 1.0,
-        },
-        assistantEl,
-      );
-    } else {
-      await streamChatResponse(baseUrl, userText, assistantEl);
+    // Convert audio blob to base64
+    const arrayBuffer = await audioBlob.arrayBuffer();
+    const bytes = new Uint8Array(arrayBuffer);
+    let binaryString = '';
+    for (let i = 0; i < bytes.length; i++) {
+      binaryString += String.fromCharCode(bytes[i]);
     }
-
+    const audioB64 = btoa(binaryString);
+    
+    const payload = {
+      audio_b64: audioB64,
+      voice,
+      lang_code: langCode,
+      speed: Number.isFinite(speed) ? speed : 1.0,
+    };
+    
+    console.log('Sending voice payload:', {
+      ...payload,
+      audio_b64: `${audioB64.substring(0, 50)}... (${audioB64.length} chars)`
+    });
+    
+    // Send to backend with audio_b64
+    await streamVoiceResponse(
+      baseUrl,
+      payload,
+      assistantEl,
+      userEl // Pass user element to update with transcription
+    );
+    
     if (!assistantEl.textContent.trim()) {
       assistantEl.textContent = "(No response text received)";
     }
   } catch (error) {
     assistantEl.textContent = `Error: ${error.message}`;
+    console.error("Voice message error:", error);
   } finally {
     setBusy(false);
-    messageInput.focus();
   }
-});
+}

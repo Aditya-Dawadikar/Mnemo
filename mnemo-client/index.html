@@ -3,23 +3,19 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Mnemo Chat</title>
+    <title>Mnemo Voice</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
     <main class="app-shell">
       <header class="topbar">
-        <h1>Mnemo Chat</h1>
-        <p>Send a message and view streamed response output.</p>
+        <h1>Mnemo Voice</h1>
+        <p>Hold the button and talk to Mnemo. Release to send.</p>
       </header>
 
       <section class="config-panel">
         <label for="apiBase">API Base URL</label>
         <input id="apiBase" type="text" value="http://localhost:8000" />
-        <label class="inline-option" for="voiceMode">
-          <input id="voiceMode" type="checkbox" />
-          Use voice chat (play streaming chunks)
-        </label>
         <div class="voice-options">
           <label for="voiceName">Voice</label>
           <input id="voiceName" type="text" value="af_heart" />
@@ -32,15 +28,9 @@
 
       <section id="chatWindow" class="chat-window" aria-live="polite"></section>
 
-      <form id="chatForm" class="composer">
-        <textarea
-          id="messageInput"
-          rows="3"
-          placeholder="Ask Mnemo anything..."
-          required
-        ></textarea>
-        <button id="sendButton" type="submit">Send</button>
-      </form>
+      <div class="composer">
+        <button id="recordButton" type="button" class="record-button">🎤 Hold to Talk</button>
+      </div>
     </main>
 
     <script src="app.js"></script>

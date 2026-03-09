@@ -9,6 +9,7 @@ services:
       - ollama
       - postgres
       - kokoro
+      - whisper
     environment:
       - DB_HOST=postgres
       - DB_PORT=5432
@@ -17,6 +18,7 @@ services:
       - DB_PASSWORD=mnemo
       - OLLAMA_URL=http://ollama:11434
       - TTS_URL=http://kokoro:8880
+      - WHISPER_URL=http://whisper:8001
     restart: unless-stopped
 
   ollama:

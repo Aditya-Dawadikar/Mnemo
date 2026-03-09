@@ -4,8 +4,10 @@ import asyncio
 import base64
 import contextlib
 import json
+import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -13,7 +15,14 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+# Import custom modules
+from modules.stt_whisper import transcribe_audio
+from modules.tts_kokoro import synthesize_and_encode_base64
+
+logger = logging.getLogger("mnemo.app")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 
 app = FastAPI(title="Mnemo Backend API")
@@ -46,17 +55,36 @@ _CLAUSE_MIN_CHARS = 24
 
 class ChatRequest(BaseModel):
 	text: str = Field(..., min_length=1)
-	system_prompt: str | None = Field(default=None, min_length=1)
-	system_prompt_file: str | None = Field(default=None, min_length=1)
+	system_prompt: str | None = Field(default=None)
+	system_prompt_file: str | None = Field(default=None)
 
 
 class VoiceChatRequest(BaseModel):
-	text: str = Field(..., min_length=1)
+	text: str | None = Field(default=None, description="Text input (alternative to audio_b64)")
+	audio_b64: str | None = Field(default=None, description="Base64-encoded audio data (webm/wav/mp3)")
 	voice: str = Field(default="af_heart")
 	lang_code: str = Field(default="a", min_length=1, max_length=1)
 	speed: float = Field(default=1.0, gt=0.0, le=3.0)
-	system_prompt: str | None = Field(default=None, min_length=1)
-	system_prompt_file: str | None = Field(default=None, min_length=1)
+	audio_language: str | None = Field(default=None, description="Language code for STT (e.g., 'en', 'es')")
+	system_prompt: str | None = Field(default=None)
+	system_prompt_file: str | None = Field(default=None)
+	
+	@model_validator(mode='after')
+	def validate_input(self):
+		"""Validate that either text or audio_b64 is provided and not empty."""
+		if not self.text and not self.audio_b64:
+			raise ValueError("Either 'text' or 'audio_b64' must be provided")
+		if self.text and self.audio_b64:
+			raise ValueError("Cannot provide both 'text' and 'audio_b64'")
+		if self.text is not None and not self.text.strip():
+			raise ValueError("'text' cannot be empty")
+		if self.audio_b64 is not None and not self.audio_b64.strip():
+			raise ValueError("'audio_b64' cannot be empty")
+		if self.system_prompt is not None and not self.system_prompt.strip():
+			raise ValueError("'system_prompt' cannot be empty")
+		if self.system_prompt_file is not None and not self.system_prompt_file.strip():
+			raise ValueError("'system_prompt_file' cannot be empty")
+		return self
 
 
 def _resolve_prompt_file_path(file_name: str) -> Path:
@@ -283,16 +311,74 @@ def _to_sse(event: str, payload: dict[str, str | int | bool]) -> bytes:
 	return f"event: {event}\ndata: {data}\n\n".encode("utf-8")
 
 
+def _log_timing_breakdown(timing: dict[str, float | None], request_start_time: float) -> None:
+	"""Log a detailed timing breakdown for the voice chat request."""
+	request_end_time = time.time()
+	total_time = request_end_time - request_start_time
+	
+	# Calculate phase durations and relative times
+	stt_duration = None
+	stt_start_rel = None
+	stt_end_rel = None
+	if timing["stt_start"] and timing["stt_end"]:
+		stt_duration = timing["stt_end"] - timing["stt_start"]
+		stt_start_rel = timing["stt_start"] - request_start_time
+		stt_end_rel = timing["stt_end"] - request_start_time
+	
+	llm_duration = None
+	llm_start_rel = None
+	llm_end_rel = None
+	if timing["llm_start"] and timing["llm_end"]:
+		llm_duration = timing["llm_end"] - timing["llm_start"]
+		llm_start_rel = timing["llm_start"] - request_start_time
+		llm_end_rel = timing["llm_end"] - request_start_time
+	
+	tts_duration = None
+	tts_start_rel = None
+	tts_end_rel = None
+	if timing["tts_start"] and timing["tts_end"]:
+		tts_duration = timing["tts_end"] - timing["tts_start"]
+		tts_start_rel = timing["tts_start"] - request_start_time
+		tts_end_rel = timing["tts_end"] - request_start_time
+	
+	# Calculate overlap (concurrent LLM and TTS)
+	overlap_duration = 0.0
+	if llm_duration and tts_duration and timing["tts_start"] and timing["llm_start"] and timing["llm_end"]:
+		# TTS starts while LLM is running
+		if timing["tts_start"] < timing["llm_end"]:
+			overlap_duration = min(timing["llm_end"], timing["tts_end"] or request_end_time) - timing["tts_start"]
+	
+	# Log the breakdown
+	logger.info("=" * 70)
+	logger.info("VOICE CHAT TIMING BREAKDOWN")
+	logger.info("=" * 70)
+	if stt_duration is not None:
+		logger.info(f"  STT Phase:")
+		logger.info(f"    Start: {stt_start_rel:.3f}s  |  End: {stt_end_rel:.3f}s  |  Duration: {stt_duration:.3f}s")
+	if llm_duration is not None:
+		logger.info(f"  LLM Phase:")
+		logger.info(f"    Start: {llm_start_rel:.3f}s  |  End: {llm_end_rel:.3f}s  |  Duration: {llm_duration:.3f}s")
+	if tts_duration is not None:
+		logger.info(f"  TTS Phase:")
+		logger.info(f"    Start: {tts_start_rel:.3f}s  |  End: {tts_end_rel:.3f}s  |  Duration: {tts_duration:.3f}s")
+	if overlap_duration > 0:
+		logger.info(f"  Concurrent Overlap: {overlap_duration:.3f}s (LLM and TTS running simultaneously)")
+	logger.info(f"  TOTAL: {total_time:.3f}s")
+	logger.info("=" * 70)
+
+
 async def _stream_ollama_tokens_to_queues(
-	payload: VoiceChatRequest,
+	transcribed_text: str,
+	system_prompt: str | None,
+	system_prompt_file: str | None,
 	clause_queue: asyncio.Queue[tuple[int, str] | None],
 	event_queue: asyncio.Queue[tuple[str, dict[str, str | int | bool]]],
 ) -> None:
 	try:
-		resolved_system_prompt = _resolve_system_prompt(payload.system_prompt, payload.system_prompt_file)
+		resolved_system_prompt = _resolve_system_prompt(system_prompt, system_prompt_file)
 		request_payload = {
 			"model": OLLAMA_MODEL,
-			"prompt": payload.text,
+			"prompt": transcribed_text,
 			"system": resolved_system_prompt,
 			"stream": True,
 		}
@@ -343,7 +429,9 @@ async def _stream_ollama_tokens_to_queues(
 
 
 async def _stream_kokoro_audio_to_events(
-	payload: VoiceChatRequest,
+	voice: str,
+	lang_code: str,
+	speed: float,
 	clause_queue: asyncio.Queue[tuple[int, str] | None],
 	event_queue: asyncio.Queue[tuple[str, dict[str, str | int | bool]]],
 ) -> None:
@@ -355,14 +443,13 @@ async def _stream_kokoro_audio_to_events(
 
 			clause_index, clause_text = clause_item
 
-			async for chunk in _stream_kokoro_audio(
+			async for chunk_b64 in synthesize_and_encode_base64(
 				text=clause_text,
-				voice=payload.voice,
-				lang_code=payload.lang_code,
-				speed=payload.speed,
+				voice=voice,
+				lang_code=lang_code,
+				speed=speed,
 			):
-				encoded = base64.b64encode(chunk).decode("ascii")
-				await event_queue.put(("audio", {"index": clause_index, "chunk_b64": encoded}))
+				await event_queue.put(("audio", {"index": clause_index, "chunk_b64": chunk_b64}))
 
 			await event_queue.put(("audio_clause_done", {"index": clause_index, "text": clause_text}))
 	except HTTPException as exc:
@@ -408,71 +495,132 @@ async def _generate_llm_response(
 	return llm_text
 
 
-async def _stream_kokoro_audio(text: str, voice: str, lang_code: str, speed: float) -> AsyncIterator[bytes]:
-	payload = {
-		"text": text,
-		"voice": voice,
-		"lang_code": lang_code,
-		"speed": speed,
-	}
 
-	async with httpx.AsyncClient(timeout=None) as client:
-		try:
-			async with client.stream(
-				"POST",
-				f"{TTS_URL}/synthesize",
-				params={"stream": "true"},
-				json=payload,
-			) as resp:
-				if resp.status_code >= 400:
-					error_body = await resp.aread()
-					raise HTTPException(
-						status_code=502,
-						detail=f"Kokoro returned {resp.status_code}: {error_body.decode('utf-8', errors='ignore')}",
-					)
-
-				async for chunk in resp.aiter_bytes():
-					if chunk:
-						yield chunk
-		except HTTPException:
-			raise
-		except httpx.HTTPError as exc:
-			raise HTTPException(status_code=502, detail=f"Failed to call Kokoro: {exc}") from exc
 
 
 async def _stream_voice_chat_events(payload: VoiceChatRequest) -> AsyncIterator[bytes]:
+	"""Stream voice chat: audio/text input -> (STT) -> LLM -> TTS -> audio output."""
+	request_start_time = time.time()
+	logger.info(f"Voice chat request: audio={bool(payload.audio_b64)}, text={bool(payload.text)}, voice={payload.voice}")
 	await _require_model_ready_for_requests()
 
-	clause_queue: asyncio.Queue[str | None] = asyncio.Queue()
+	clause_queue: asyncio.Queue[tuple[int, str] | None] = asyncio.Queue()
 	event_queue: asyncio.Queue[tuple[str, dict[str, str | int | bool]]] = asyncio.Queue()
-
-	text_task = asyncio.create_task(_stream_ollama_tokens_to_queues(payload, clause_queue, event_queue))
-	audio_task = asyncio.create_task(_stream_kokoro_audio_to_events(payload, clause_queue, event_queue))
-
-	text_done = False
-	audio_done = False
+	
+	# Timing tracking
+	timing = {
+		"stt_start": None,
+		"stt_end": None,
+		"llm_start": None,
+		"llm_end": None,
+		"tts_start": None,
+		"tts_end": None,
+	}
 
 	try:
+		# Determine input text (from direct text or from STT)
+		if payload.audio_b64:
+			# Step 1: Decode audio from base64
+			logger.debug(f"Decoding base64 audio ({len(payload.audio_b64)} chars)")
+			try:
+				audio_data = base64.b64decode(payload.audio_b64)
+				logger.info(f"Audio decoded: {len(audio_data)} bytes")
+			except Exception as exc:
+				logger.error(f"Failed to decode base64 audio: {exc}")
+				yield _to_sse("error", {"message": f"Invalid base64 audio data: {exc}"})
+				return
+
+			# Step 2: Transcribe audio using Whisper STT
+			timing["stt_start"] = time.time()
+			logger.info(f"Starting STT transcription for {len(audio_data)} bytes")
+			yield _to_sse("stt_started", {"status": "transcribing"})
+			try:
+				transcribed_text = await transcribe_audio(audio_data, payload.audio_language)
+				timing["stt_end"] = time.time()
+				logger.info(f"STT complete: '{transcribed_text}'")
+				yield _to_sse("stt_done", {"text": transcribed_text})
+			except HTTPException as exc:
+				timing["stt_end"] = time.time()
+				logger.error(f"STT failed: {exc.detail}")
+				yield _to_sse("error", {"message": f"STT failed: {exc.detail}"})
+				return
+		else:
+			# Use provided text directly
+			logger.info(f"Using provided text: '{payload.text}'")
+			transcribed_text = payload.text
+
+		# Step 3: Stream LLM response
+		timing["llm_start"] = time.time()
+		logger.info(f"Starting LLM generation")
+		yield _to_sse("llm_started", {"status": "generating"})
+		text_task = asyncio.create_task(
+			_stream_ollama_tokens_to_queues(
+				transcribed_text,
+				payload.system_prompt,
+				payload.system_prompt_file,
+				clause_queue,
+				event_queue,
+			)
+		)
+
+		# Step 4: Stream TTS audio output
+		timing["tts_start"] = time.time()
+		logger.info(f"Starting TTS synthesis")
+		yield _to_sse("tts_started", {"status": "synthesizing"})
+		audio_task = asyncio.create_task(
+			_stream_kokoro_audio_to_events(
+				payload.voice,
+				payload.lang_code,
+				payload.speed,
+				clause_queue,
+				event_queue,
+			)
+		)
+
+		text_done = False
+		audio_done = False
+
 		while not (text_done and audio_done):
 			event_name, event_payload = await event_queue.get()
 			if event_name == "text_done":
 				text_done = True
+				timing["llm_end"] = time.time()
+				logger.info("LLM generation complete")
 			if event_name == "audio_done":
 				audio_done = True
+				timing["tts_end"] = time.time()
+				logger.info("TTS synthesis complete")
 
 			yield _to_sse(event_name, event_payload)
 
+		logger.info("Voice chat request completed successfully")
 		yield _to_sse("done", {"done": True})
+		
+		# Log timing breakdown
+		_log_timing_breakdown(timing, request_start_time)
+
 	except HTTPException as exc:
+		timing["tts_end"] = timing["tts_end"] or time.time()
+		timing["llm_end"] = timing["llm_end"] or time.time()
+		timing["stt_end"] = timing["stt_end"] or time.time()
+		_log_timing_breakdown(timing, request_start_time)
+		logger.error(f"HTTPException in voice chat: {exc.detail}")
 		yield _to_sse("error", {"message": str(exc.detail)})
 	except Exception as exc:
+		timing["tts_end"] = timing["tts_end"] or time.time()
+		timing["llm_end"] = timing["llm_end"] or time.time()
+		timing["stt_end"] = timing["stt_end"] or time.time()
+		_log_timing_breakdown(timing, request_start_time)
+		logger.exception(f"Unexpected error in voice chat: {exc}")
 		yield _to_sse("error", {"message": f"Voice stream failed: {exc}"})
 	finally:
-		for task in (text_task, audio_task):
-			if not task.done():
-				task.cancel()
+		if 'text_task' in locals() and not text_task.done():
+			text_task.cancel()
+		if 'audio_task' in locals() and not audio_task.done():
+			audio_task.cancel()
 		with contextlib.suppress(Exception):
-			await asyncio.gather(text_task, audio_task)
+			if 'text_task' in locals() and 'audio_task' in locals():
+				await asyncio.gather(text_task, audio_task)
 
 
 @app.get("/health")

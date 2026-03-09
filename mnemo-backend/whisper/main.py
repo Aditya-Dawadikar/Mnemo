@@ -4,12 +4,14 @@ import io
 import json
 import logging
 import os
+import tempfile
 import time
 import wave
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from faster_whisper import WhisperModel
 
@@ -186,6 +188,90 @@ def health_check() -> dict[str, str]:
 @app.on_event("startup")
 def warmup_model() -> None:
 	_get_model()
+
+
+@app.post("/transcribe")
+async def transcribe(
+	file: UploadFile = File(...),
+	language: str | None = Form(default=None),
+) -> dict[str, str]:
+	"""
+	Transcribe an audio file using Whisper.
+	Accepts multipart/form-data with:
+	- file: Audio file (wav, mp3, webm, ogg, etc.)
+	- language: Optional language code (e.g., 'en', 'es')
+	"""
+	logger.info(f"Transcribe request: file={file.filename}, language={language}")
+	try:
+		# Read the uploaded file
+		audio_data = await file.read()
+		logger.info(f"Audio file received: {len(audio_data)} bytes")
+		
+		if not audio_data:
+			logger.warning("Empty audio file received")
+			raise HTTPException(
+				status_code=400,
+				detail="Empty audio file"
+			)
+		
+		logger.debug(f"Saving audio to temp file")
+		# Save to temporary file and let faster-whisper handle format detection
+		with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp_file:
+			tmp_file.write(audio_data)
+			tmp_path = tmp_file.name
+		
+		logger.info(f"Starting transcription: {tmp_path}")
+		try:
+			# Transcribe using the model (faster-whisper handles format conversion via ffmpeg)
+			model = _get_model()
+			lang = language or DEFAULT_LANGUAGE
+			logger.debug(f"Calling faster-whisper with language={lang}")
+			
+			segments, info = model.transcribe(
+				tmp_path,
+				language=lang,
+				beam_size=5,
+				temperature=0.0,
+				vad_filter=True,
+			)
+			
+			# Collect all text segments
+			text_parts = []
+			for segment in segments:
+				if segment.text:
+					text_parts.append(segment.text.strip())
+			
+			transcribed_text = " ".join(text_parts).strip()
+			logger.info(f"Transcription result: '{transcribed_text}'")
+			
+			if not transcribed_text:
+				logger.warning("No speech detected in audio")
+				raise HTTPException(
+					status_code=400,
+					detail="No speech detected in audio"
+				)
+			
+			logger.info(f"Transcription successful")
+			return {
+				"text": transcribed_text,
+				"language": info.language if hasattr(info, 'language') else lang,
+			}
+		finally:
+			# Clean up temp file
+			try:
+				Path(tmp_path).unlink()
+				logger.debug(f"Cleaned up temp file: {tmp_path}")
+			except Exception:
+				pass
+	
+	except HTTPException:
+		raise
+	except Exception as exc:
+		logger.exception(f"Transcription failed: {exc}")
+		raise HTTPException(
+			status_code=500,
+			detail=f"Transcription failed: {exc}"
+		) from exc
 
 
 @app.websocket("/ws/transcribe")
