@@ -5,6 +5,7 @@ Mnemo is a local-first conversational assistant stack with:
 - `mnemo-backend/app`: FastAPI orchestration API
 - `mnemo-backend/ollama`: LLM runtime (default model: `llama3:8b`)
 - `mnemo-backend/kokoro`: FastAPI TTS service (Kokoro)
+- `mnemo-backend/whisper`: FastAPI realtime STT service (faster-whisper)
 - `mnemo-client`: lightweight HTML/CSS/JS chat UI
 
 It supports:
@@ -43,6 +44,7 @@ docker compose up -d --build
 Services:
 
 - App API: `http://localhost:8000`
+- Whisper API: `http://localhost:8001`
 - Ollama: `http://localhost:11434`
 - Kokoro: `http://localhost:8880`
 - Postgres: `localhost:5432`
@@ -151,6 +153,26 @@ SSE events emitted by backend:
 - `audio_done`: audio generation finished
 - `done`: stream complete
 - `error`: recoverable/final stream error information
+
+### Realtime Speech-To-Text (Bidirectional Streaming)
+
+- `WS /ws/transcribe` on `whisper` service (`ws://localhost:8001/ws/transcribe`)
+- Binary frames: audio blobs (16-bit PCM chunks or WAV blobs)
+- Text frames: JSON control events
+
+Control events sent by client:
+
+- `{"event":"start","sample_rate":48000,"language":"en"}`
+- `{"event":"flush"}`
+- `{"event":"end"}`
+
+Events sent by server:
+
+- `ready`: socket accepted and format metadata
+- `started`: stream metadata acknowledged
+- `token`: one finalized word token with timestamps (`start`, `end` seconds)
+- `done`: final stitched transcript text
+- `error`: protocol or decoding/transcription issues
 
 The client renders `token` events to the chat bubble as they arrive and buffers `audio` chunks per clause. It queues playback only after `audio_clause_done`, so chunks play sequentially and smoothly.
 

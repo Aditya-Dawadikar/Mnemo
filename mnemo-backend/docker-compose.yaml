@@ -37,6 +37,15 @@ services:
       - kokoro_cache:/root/.cache/huggingface
     restart: unless-stopped
 
+  whisper:
+    build: ./whisper
+    container_name: mnemo_whisper
+    ports:
+      - "8001:8001"
+    volumes:
+      - whisper_cache:/root/.cache/huggingface
+    restart: unless-stopped
+
   postgres:
     image: pgvector/pgvector:pg16
     container_name: mnemo_postgres
@@ -54,3 +63,4 @@ volumes:
   ollama_data:
   postgres_data:
   kokoro_cache:
+  whisper_cache:
