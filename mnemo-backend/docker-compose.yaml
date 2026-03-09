@@ -1,0 +1,56 @@
+services:
+
+  app:
+    build: ./app
+    container_name: mnemo_app
+    ports:
+      - "8000:8000"
+    depends_on:
+      - ollama
+      - postgres
+      - kokoro
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=mnemo
+      - DB_USER=mnemo
+      - DB_PASSWORD=mnemo
+      - OLLAMA_URL=http://ollama:11434
+      - TTS_URL=http://kokoro:8880
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: mnemo_ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+
+  kokoro:
+    build: ./kokoro
+    container_name: mnemo_kokoro
+    ports:
+      - "8880:8880"
+    volumes:
+      - kokoro_cache:/root/.cache/huggingface
+    restart: unless-stopped
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: mnemo_postgres
+    environment:
+      POSTGRES_DB: mnemo
+      POSTGRES_USER: mnemo
+      POSTGRES_PASSWORD: mnemo
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  ollama_data:
+  postgres_data:
+  kokoro_cache:
