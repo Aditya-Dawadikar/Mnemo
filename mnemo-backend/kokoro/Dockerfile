@@ -12,6 +12,8 @@ RUN apt-get update \
 
 COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
+RUN pip uninstall -y en_core_web_sm || true
+RUN python -m spacy download en_core_web_sm
 
 COPY main.py ./main.py
 

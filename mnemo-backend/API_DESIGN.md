@@ -148,8 +148,7 @@ All components are designed for streaming to minimize latency and provide real-t
 **Status Events**: `llm_started`, `text_done`
 
 **Clause Detection**:
-- Uses punctuation boundaries (`.!?;:`)
-- Minimum 5 words or 24 characters
+- Buffers text until a punctuation boundary is reached (`.!?;:`)
 - Enables low-latency TTS streaming
 
 ### Phase 3: Text-to-Speech (TTS)
@@ -191,7 +190,7 @@ data: {"message": "Detailed error description"}
 - `TTS_URL`: TTS service URL (default: `http://kokoro:8880`)
 
 **LLM Settings**:
-- `OLLAMA_MODEL`: Model name (default: `llama3:8b`)
+- `OLLAMA_MODEL`: Model name (default: `llama3.2:3b`)
 - `OLLAMA_SYSTEM_PROMPT_FILE`: Default prompt file (default: `system_prompt.txt`)
 - `OLLAMA_SYSTEM_PROMPT`: Optional inline default prompt
 

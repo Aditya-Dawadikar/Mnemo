@@ -3,7 +3,7 @@
 Mnemo is a local-first conversational assistant stack with:
 
 - `mnemo-backend/app`: FastAPI orchestration API
-- `mnemo-backend/ollama`: LLM runtime (default model: `llama3:8b`)
+- `mnemo-backend/ollama`: LLM runtime (default model: `llama3.2:3b`)
 - `mnemo-backend/kokoro`: FastAPI TTS service (Kokoro)
 - `mnemo-backend/whisper`: FastAPI realtime STT service (faster-whisper)
 - `mnemo-client`: lightweight HTML/CSS/JS chat UI
@@ -37,6 +37,13 @@ mnemo-client/
 
 ### 1. Start services
 
+GPU-backed inference requires Docker GPU support on the host:
+
+- Windows with Docker Desktop: enable WSL2-based engine and ensure NVIDIA GPU support is working in Docker Desktop.
+- Linux: install the NVIDIA Container Toolkit.
+
+The `ollama`, `kokoro`, and `whisper` services are configured with `gpus: all` so they can use the host GPU when available.
+
 From `mnemo-backend`:
 
 ```powershell
@@ -55,15 +62,15 @@ All services except the App API are internal and accessed by the backend only. C
 
 ### 2. First run model pull behavior
 
-The app automatically checks for and pulls `llama3:8b` from Ollama when missing.
+The `ollama` container startup script checks for `llama3.2:3b` and pulls it if missing.
 
-- While downloading, `/chat` and `/voice/chat` return `503` with a retry message.
-- Once ready, requests succeed normally.
+- The `ollama` service is marked healthy only after the model exists locally.
+- The `app` service waits for `ollama` health before starting.
 
 Optional manual pre-pull:
 
 ```powershell
-docker exec -it mnemo_ollama ollama pull llama3:8b
+docker exec -it mnemo_ollama ollama pull llama3.2:3b
 ```
 
 ### 3. Open the client
